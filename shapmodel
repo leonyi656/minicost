@@ -1,0 +1,232 @@
+ -*- coding: utf-8 -*-
+"""
+Author  : liyiyang (re-revised)
+Purpose : SHAP analysis of human-activity drivers on water/carbon/food surplus
+Outputs :
+  - shap_values_<target>_<year>.csv            (city × feature SHAP matrix)
+  - shap_human_<target>_<year>.png             (per-year beeswarm)
+  - shap_<target>_Average.png                  (stacked Average beeswarm)
+  - <target>_SHAP_six_panel_grid.png           (2×3 panel: 2000..2020 + Average)
+  - shap_summary_<target>.csv                  (yearly mean SHAP table)
+  - avg_contrib_<target>.png                   (mean-contrib barh)
+  - clustermap_<target>.png                    (clustered heatmap)
+"""
+
+import re
+import os
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+
+from sklearn.preprocessing import StandardScaler
+from sklearn.ensemble import (
+    RandomForestRegressor, GradientBoostingRegressor,
+    AdaBoostRegressor, StackingRegressor
+)
+from sklearn.linear_model import LinearRegression
+from xgboost import XGBRegressor
+from lightgbm import LGBMRegressor
+from catboost import CatBoostRegressor
+
+import shap
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# ----------------------------- Matplotlib -----------------------------------
+plt.rcParams["font.family"] = "sans-serif"
+plt.rcParams["font.sans-serif"] = ["Arial", "DejaVu Sans"]
+plt.rcParams["axes.unicode_minus"] = False
+plt.rcParams["figure.dpi"] = 120
+
+# ------------------------------ I/O 路径 ------------------------------------
+DATA_CSV = Path(r"G:/生态系统指标/surplus.csv")      # ← 修改为你的实际路径
+OUT_DIR   = Path("shap_outputs")
+PANEL_DIR = OUT_DIR / "panels"
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+PANEL_DIR.mkdir(parents=True, exist_ok=True)
+
+# --------------------------- 控制项（速度/标题） -----------------------------
+SEED = 42
+BG_N = 100          # KernelExplainer 背景样本数，降到 50 可加速
+NSAMPLES = "auto"   # 或设为 100~300 之间整数
+ADD_BEESWARM_TITLE = True     # 单张 beeswarm 顶部是否显示年份/“Average”
+SHOW_PANEL_TITLES  = True     # 2×3 联图是否显示 (a)(b)… 子图标题
+
+# ------------------------------ 读入与预处理 --------------------------------
+data = pd.read_csv(DATA_CSV)
+data.columns = data.columns.str.lower().str.strip()
+data.rename(columns={"2010atersurplus": "2010watersurplus"}, inplace=True)
+
+def rear_year(col: str) -> str:
+    m = re.match(r"^(\d{4})([a-z].*)$", col)
+    return f"{m.group(2)}{m.group(1)}" if m else col
+
+data.columns = [rear_year(c) for c in data.columns]
+
+scaler = StandardScaler()
+data_scaled = pd.DataFrame(scaler.fit_transform(data), columns=data.columns, index=data.index)
+
+# ------------------------------ 变量定义 ------------------------------------
+human_features = ["ur", "nli", "gdp", "pigdp", "sigdp", "tigdp", "cla", "pd"]
+targets = {
+    "watersurplus": "Water Surplus",
+    "carbonsurplus": "Carbon Surplus",
+    "foodsurplus":   "Food Surplus"
+}
+years = [2000, 2005, 2010, 2015, 2020, 2023]
+
+# ------------------------------ 模型集合 ------------------------------------
+base_learners = [
+    ("rf",   RandomForestRegressor(n_estimators=150, random_state=SEED, n_jobs=-1)),
+    ("gb",   GradientBoostingRegressor(n_estimators=150, random_state=SEED)),
+    ("xgb",  XGBRegressor(n_estimators=200, max_depth=5, learning_rate=0.05,
+                          subsample=0.8, colsample_bytree=0.8,
+                          reg_lambda=1.0, random_state=SEED, verbosity=0, n_jobs=-1)),
+    ("lgbm", LGBMRegressor(n_estimators=300, learning_rate=0.05, subsample=0.8,
+                           colsample_bytree=0.8, random_state=SEED, verbose=-1, n_jobs=-1)),
+    ("cat",  CatBoostRegressor(n_estimators=300, learning_rate=0.05, depth=6,
+                               random_state=SEED, verbose=0)),
+    ("ada",  AdaBoostRegressor(n_estimators=200, random_state=SEED)),
+]
+meta_learner = LinearRegression()
+
+# ----------------------------- 工具函数 --------------------------------------
+def shap_one_year(X, y, feature_names, year, target_key, target_name, city_codes):
+    """
+    训练当年模型，计算 Kernel SHAP：
+      - 保存当年 beeswarm 图
+      - 返回：样本级 shap_values (ndarray)、X_short(DataFrame)、mean_shap(DataFrame)
+    """
+    # 简化列名：UR2000 -> UR
+    short_names = [f.replace(str(year), "") for f in feature_names]
+    X_short = X.copy()
+    X_short.columns = short_names
+
+    model = StackingRegressor(estimators=base_learners, final_estimator=meta_learner, cv=5, n_jobs=-1)
+    model.fit(X, y)
+
+    bg = shap.sample(X, min(BG_N, len(X)), random_state=SEED)
+    explainer = shap.KernelExplainer(lambda d: model.predict(pd.DataFrame(d, columns=feature_names)), bg)
+    shap_values = explainer.shap_values(X, nsamples=NSAMPLES)
+
+    # 单年 beeswarm
+    plt.figure()
+    shap.summary_plot(shap_values, X_short, feature_names=short_names, show=False, plot_size=(7, 5))
+    if ADD_BEESWARM_TITLE:
+        plt.title(f"{year}", pad=8)
+    f_png = OUT_DIR / f"shap_human_{target_key}_{year}.png"
+    plt.savefig(f_png, dpi=220, bbox_inches="tight")
+    plt.close()
+
+    # 城市×特征矩阵
+    detail_df = pd.DataFrame(shap_values, columns=short_names, index=city_codes)
+    detail_df.index.name = "citycode"
+    detail_df.to_csv(OUT_DIR / f"shap_values_{target_key}_{year}.csv", encoding="utf-8-sig")
+
+    # 年度均值表（合并汇总用）
+    mean_df = detail_df.mean(axis=0).reset_index().rename(columns={"index": "feature", 0: f"{year}"})
+
+    return shap_values, X_short, mean_df, f_png
+
+def merge_yearly(tbls):
+    out = tbls[0]
+    for t in tbls[1:]:
+        out = pd.merge(out, t, on="feature", how="outer")
+    return out.set_index("feature")
+
+def make_six_panel(panel_pngs, panel_titles, out_path):
+    fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+    axes = axes.ravel()
+    for ax, pth, ttl in zip(axes, panel_pngs, panel_titles):
+        img = plt.imread(pth)
+        ax.imshow(img)
+        ax.axis("off")
+        if SHOW_PANEL_TITLES:
+            ax.set_title(ttl, fontsize=14, pad=6)
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=220, bbox_inches="tight")
+    plt.close()
+
+# ------------------------------ 主流程 ---------------------------------------
+# 为每个目标分别做：6 张单年 + 1 张 Average + 2×3 联图
+for tgt_key, tgt_name in targets.items():
+    print(f"\n==== Processing {tgt_name} ====")
+    yearly_tables = []
+    all_shap_arrays = []
+    all_X_short = []
+    peryear_imgs = []
+
+    for year in years:
+        human_cols = [f"{v}{year}" for v in human_features]
+        tgt_col = f"{tgt_key}{year}"
+        need_cols = human_cols + [tgt_col]
+
+        if not set(need_cols).issubset(data_scaled.columns):
+            print(f"⚠️  {tgt_key}-{year} 缺少列，跳过：{set(need_cols) - set(data_scaled.columns)}")
+            continue
+
+        df_y = data_scaled[need_cols].dropna()
+        X = df_y[human_cols]
+        y = df_y[tgt_col]
+
+        city_codes = (data.loc[df_y.index, "citycode"]
+                      if "citycode" in data.columns else df_y.index)
+
+        shap_vals, X_short, mean_tbl, img_path = shap_one_year(
+            X, y, human_cols, year, tgt_key, tgt_name, city_codes
+        )
+        yearly_tables.append(mean_tbl)
+        all_shap_arrays.append(shap_vals)
+        all_X_short.append(X_short)
+        peryear_imgs.append(img_path)
+        print(f"  ✅ {tgt_key}-{year} done")
+
+    # Average 面板（把 6 年样本级 SHAP 与 X 纵向堆叠）
+    if len(all_shap_arrays) > 0:
+        X_all = pd.concat(all_X_short, ignore_index=True)
+        shap_all = np.vstack(all_shap_arrays)
+
+        plt.figure()
+        shap.summary_plot(shap_all, X_all, feature_names=X_all.columns.tolist(),
+                          show=False, plot_size=(7, 5))
+        if ADD_BEESWARM_TITLE:
+            plt.title("Average", pad=8)
+        avg_png = OUT_DIR / f"shap_{tgt_key}_Average.png"
+        plt.savefig(avg_png, dpi=220, bbox_inches="tight")
+        plt.close()
+        peryear_imgs.append(avg_png)
+    else:
+        print(f"❗ {tgt_key} 无可用年份，跳过 Average/联图")
+        continue
+
+    # 年度均值表与可视化
+    df_tgt = merge_yearly(yearly_tables)
+    df_tgt.to_csv(OUT_DIR / f"shap_summary_{tgt_key}.csv", encoding="utf-8-sig")
+
+    plt.figure(figsize=(8, 6))
+    df_tgt.mean(axis=1).sort_values().plot(kind="barh", color="skyblue")
+    plt.axvline(0, color="gray", linestyle="--")
+    plt.xlabel("Mean SHAP value")
+    plt.title(f"Average contribution of human activities to {tgt_name}")
+    plt.tight_layout()
+    plt.savefig(OUT_DIR / f"avg_contrib_{tgt_key}.png", dpi=150, bbox_inches="tight")
+    plt.close()
+
+    sns.clustermap(df_tgt.dropna(), cmap="RdBu_r", center=0,
+                   linewidths=0.5, col_cluster=False, figsize=(12, 8))
+    plt.savefig(OUT_DIR / f"clustermap_{tgt_key}.png", dpi=160, bbox_inches="tight")
+    plt.close()
+
+    # 2×3 联图（2000..2020 + Average）
+    # 若某些年份缺列被跳过，此处按已有顺序拼接
+    titles = []
+    for i, y in enumerate(years[:len(peryear_imgs)-1]):  # 最后一张是 Average
+        titles.append(f"({chr(97+i)}) {y}")
+    titles.append(f"({chr(97+len(titles))}) Average")
+
+    six_panel_path = PANEL_DIR / f"{tgt_key}_SHAP_six_panel_grid.png"
+    make_six_panel(peryear_imgs, titles, six_panel_path)
+    print(f"  📊 saved 2×3 panel → {six_panel_path}")
+
+print("\n🎉 All SHAP analyses finished. Outputs saved in:", OUT_DIR.resolve())
